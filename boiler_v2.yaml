@@ -1,0 +1,856 @@
+# ============================================================
+# ESP8285 BOILER CONTROL — ESPHome Config v4 (боевые настройки)
+# ============================================================
+# РАСШИФРОВАННЫЙ протокол твердотопливного котла.
+# ДВУХКОТЛОВАЯ СИСТЕМА: твердотоп (основной) + электро (резерв).
+# ESP-01S (ESP8266) заменяет оригинальный WiFi-модуль.
+#
+# UART: 9600 8N1, кадры SOH(0x01)/TYPE/STX(0x02)/DATA/ETX(0x03)
+# Формат команды: SOH + "1" + STX + "0" + %02d_value + keypair + ETX (9 байт)
+#
+# ===== EEPROM ПАРАМЕТРЫ (сохраняются в плату) =====
+#   Пар  Отв  Команда  Дефолт  Боевое  Дисплей  Назначение
+#   [0]  E    EF=XX    65      39      tA       НАСОС ВКЛ при T≥E (°C), GPIO4
+#   [1]  K    JK=XX    20      20      —        Калибровка NTC: смещение = K-20
+#   [3]  B    BC=XX    10      10      Pr PA    Перерыв продувки (мин)
+#   [4]  L    KL=XX    30      20      dt       Время розжига (мин)
+#   [5]  D    DE=XX    100     60      nP/On    Мощность вент. макс (%)
+#   [8]  A    AB=XX    20      20      Pr       Время продувки (сек)
+#   [9]  F    FG=XX    30      39      tP       Порог огня/розжига (°C), поле G
+#   [10] C    CD=XX    60      40      Ob       Обороты вент. мин (%)
+#   [7]  a    ab=XX    50      30      tE       Темп. угасания — порог вент. (°C)
+#   ⚠️ «ВОДА 50°C» на главном экране Telegram — уставка БОТА (de=0 при T≥50)
+#   Бот/облако управляли de=1/de=0, это НЕ EEPROM параметр прошивки.
+#   Hi (гистерезис) — в прошивке v2.2.2 зашит 1°C, не настраивается.
+#
+# ===== АЛГОРИТМ (двухкотловая система, твердотоп + электро) =====
+#   СТАРТ (розжиг):
+#     1) Вентилятор на D% (60%) — максимальный наддув
+#     2) Таймер L мин (20 мин):
+#        — T > ab (50°C) → вент. снижается до C% (40%) — огонь есть
+#        — T ≥ E (39°C) → насос ВКЛ (GPIO4=1, вода прогрелась)
+#     3) Если за L мин T < ab → затухание → вент. OFF
+#   РАБОТА:
+#     - delta = ab - T → TRIAC модулирует вент. от C% (при T≈ab) до D%
+#     - Продувка: каждые B мин вент. MAX на A сек (дожиг газов)
+#     - Насос: прошивка включает при T≥E (GPIO4=HIGH)
+#     - ESPHome: hi=0 каждую секунду (мьют зуммера, ЭКО НЕ активируется)
+#   СТОП (затухание):
+#     1) T < E-2 (37°C) → GPIO4=0 → насос ВЫКЛ (гист. 2°C)
+#        → электрокотёл берёт нагрузку
+#     2) T < ab (50°C) → вент. пытается раздуть, если L-таймер → вент. OFF
+#   ЗАЩИТА: T≥90°C → j=1 + дисплей мигает, T≥120°C(5с) → g=1 + GPIO5 пульсирует
+#
+# ===== АВАРИЙНАЯ СИСТЕМА (зашита в прошивку, НЕ настраивается) =====
+#   90°C ≤ T < 120°C → предупреждение (j=1): дисплей мигает
+#   T ≥ 120°C (5 сек) → перегрев (g=1): GPIO5 пульсирует (аварийный насос)
+#   Зуммер: встроен в TM1637, мьютится командой hi=0 каждую секунду
+#   Пороги 90/120°C ЗАШИТЫ в прошивку, изменить НЕЛЬЗЯ.
+#
+# ===== RUNTIME КОМАНДЫ (не сохраняются в EEPROM) =====
+#   de=1 / de=0  → МАСТЕР ON/OFF нагрева
+#   hi=1          → тоггл Комфорт/Эко (дебаунс 120с)
+#
+# ===== ОТВЕТ ПЛАТЫ =====
+#   Runtime: a<уставка>bcd<темп>e<режим>f<версия>g<перегрев>hij<предупр>k<эко>l
+#   EEPROM:  A<p8>B<p3>C<p10>D<p5>E<p0>F<p9>G<горение>HIJK<p1>L<p4>M
+#   g = перегрев (T≥120°C, 5 сек) → GPIO5 пульсирует, дисплей мигает
+#   j = предупреждение (90≤T<120°C) → дисплей мигает
+#   G = статус горения (НЕ насос!):
+#     G=0 → нет горения / безопасно
+#     G=1 → горение есть
+#
+# GPIO: 4=реле(НАСОС), 5=аварийн.насос(перегрев), 12=ZC(вход), 15=TRIAC(выход)
+# GPIO: 9,10=кнопки(вход), 14=TM1637-CLK, 16=TM1637-DIO
+# LED1-LED6: все управляются через TM1637 (5-й байт, биты 0-4)
+#   LED1 — не используется (GRID6, никогда не пишется)
+#   LED2 — Насос (бит 4), LED3 — Вентилятор (бит 3)
+#   LED4 — Розжиг (бит 2, мигает), LED5 — WiFi (бит 1)
+#   LED6 — Комнатная T (бит 0) — горит при heartbeat='2' !
+# Heartbeat TYPE2: первый байт данных = WiFi-статус:
+#   '1' → LED5 мигает 500мс (поиск WiFi / подключён)
+#   '3' → LED5 мигает 100мс (AP mode — нужна настройка!)
+#   '0' → LED5 не горит
+#   ⚠️ '2' → LED6 загорается (артефакт — не отправлять!)
+#   ⚠️ Счётчик heartbeat ДОЛЖЕН инкрементироваться! Статический
+#      счётчик '0' → ESP8285 считает heartbeat мёртвым → LED5 гаснет!
+# КНОПКА 4 (5 сек): ESP8285 отправляет e=3 → ESP-01S включает AP
+#
+# ===== GPIO4 НАСОС =====
+#   Насос управляется ПРОШИВКОЙ через E-термостат (param[0]):
+#     T ≥ E (39°C) → GPIO4=HIGH → насос ВКЛ
+#     T < E-2 (37°C) → GPIO4=LOW → насос ВЫКЛ (гистерезис 2°C)
+#   ⚠️ E=99 ОТКЛЮЧАЕТ НАСОС (порог 99°C — никогда не достигается)!
+#   ⚠️ E=0 ФОРСИРУЕТ НАСОС (всегда ВКЛ, специальный случай).
+#   GPIO5 = аварийный насос при перегреве (T>90°C).
+#   ESPHome НЕ управляет насосом — только EEPROM параметр E.
+#
+# ===== ЭКО-РЕЖИМ =====
+#   ЭКО (k=1) меняет целевую вент. с ab на F+5.
+#   ВАЖНО: hi=1 ВКЛЮЧАЕТ ЭКО! hi=0 — НЕ включает.
+#   Отправляем hi=0 каждую секунду → мьют зуммера БЕЗ активации ЭКО.
+#   Через 120с без hi=1 → ЭКО автоматически выключается (debounce).
+#   Если ЭКО был включён ДО нас → через 120с сам выключится.
+# ============================================================
+
+esphome:
+  name: regler
+  friendly_name: "Boiler Control"
+  # SDK функции: wifi_set_opmode_current(), wifi_get_opmode(),
+  # wifi_softap_get_config(), wifi_softap_set_config_current()
+  includes:
+    - wifi_setup.h
+  on_boot:
+    - priority: 300
+      then:
+        - lambda: |-
+            // Read custom WiFi creds from our flash sector BEFORE ESPHome WiFi starts (250)
+            BoilerWifiCreds cr;
+            if (ESP.flashRead(BWIFI_ADDR, (uint32_t*)&cr, sizeof(cr))
+                && cr.magic == BWIFI_MAGIC && cr.ssid[0]) {
+              wifi::WiFiAP ap;
+              ap.set_ssid(std::string(cr.ssid));
+              ap.set_password(std::string(cr.pass));
+              wifi::global_wifi_component->set_sta(ap);
+            }
+    - priority: -10
+      then:
+        - lambda: |-
+            // POST /w → save WiFi to our flash sector + reboot
+            id(web_base).get_server()->on("/w", HTTP_POST,
+              [](AsyncWebServerRequest *r) {
+              if (r->hasParam("s", true)) {
+                BoilerWifiCreds cr;
+                cr.magic = BWIFI_MAGIC;
+                memset(cr.ssid, 0, sizeof(cr.ssid));
+                memset(cr.pass, 0, sizeof(cr.pass));
+                strncpy(cr.ssid, r->getParam("s", true)->value().c_str(), 35);
+                if (r->hasParam("p", true))
+                  strncpy(cr.pass, r->getParam("p", true)->value().c_str(), 63);
+                ESP.flashEraseSector(BWIFI_SECTOR);
+                ESP.flashWrite(BWIFI_ADDR, (uint32_t*)&cr, sizeof(cr));
+              } else {
+                ESP.flashEraseSector(BWIFI_SECTOR);
+              }
+              r->send(200, "text/plain", "OK");
+              id(g_restart_pending) = millis() + 2000;
+            });
+
+esp8266:
+  board: esp01_1m
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  ap:
+    ssid: "Boiler-AP"
+    password: !secret ap_password
+
+logger:
+  level: ERROR
+  baud_rate: 0
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# ============================================================
+# WEB SERVER — локальный веб-интерфейс (http://IP:80)
+# v1 = минимальный, HTML на лету
+# CDN oi.esphome.io недоступен → мини JS/CSS встроены в прошивку
+# js_include  → gzip в PROGMEM, отдаётся как /0.js
+# css_include → gzip в PROGMEM, отдаётся как /0.css
+# js_url: "/0.js" — вставляет <script src="/0.js"> в HTML
+#   (js_include сам по себе НЕ вставляет тег — баг ESPHome)
+# POST /w — WiFi config (save/reset)
+# ============================================================
+web_server_base:
+  id: web_base
+
+web_server:
+  port: 80
+  version: 1
+  css_url: ""
+  js_url: "/0.js"
+  css_include: "webserver.css"
+  js_include: "webserver.js"
+
+# ============================================================
+# UART — подключение к ESP8285 мат. платы котла
+# ============================================================
+uart:
+  id: uart_boiler
+  tx_pin: GPIO1
+  rx_pin: GPIO3
+  baud_rate: 9600
+  data_bits: 8
+  stop_bits: 1
+  parity: NONE
+
+# ============================================================
+# GLOBALS
+# ============================================================
+globals:
+  - id: hb_counter
+    type: int
+    initial_value: '0'
+
+  - id: hb_enabled
+    type: bool
+    initial_value: 'true'
+
+  - id: hb_static
+    type: bool
+    initial_value: 'false'
+
+  - id: cmd_sent_ms
+    type: uint32_t
+    initial_value: '0'
+
+  - id: cmd_needs_mute
+    type: bool
+    initial_value: 'false'
+
+  # --- Runtime (из ответа) ---
+  - id: g_temp
+    type: int
+    initial_value: '-99'
+  - id: g_mode
+    type: int
+    initial_value: '-1'
+  - id: g_fire
+    type: int
+    initial_value: '-1'
+  - id: g_eco
+    type: int
+    initial_value: '-1'
+  - id: g_overheat
+    type: int
+    initial_value: '0'
+  - id: g_warning
+    type: int
+    initial_value: '0'
+  - id: g_setpoint
+    type: int
+    initial_value: '0'
+  # --- EEPROM params (из ответа) ---
+  - id: g_E
+    type: int
+    initial_value: '0'
+  - id: g_A
+    type: int
+    initial_value: '0'
+  - id: g_B
+    type: int
+    initial_value: '0'
+  - id: g_C
+    type: int
+    initial_value: '0'
+  - id: g_D
+    type: int
+    initial_value: '0'
+  - id: g_F
+    type: int
+    initial_value: '0'
+  - id: g_K
+    type: int
+    initial_value: '0'
+  - id: g_L
+    type: int
+    initial_value: '0'
+
+  # --- AP mode (кнопка 4, 5 сек, авто-off 5мин) ---
+  - id: g_ap_active
+    type: uint32_t
+    initial_value: '0'
+  # --- Deferred restart ---
+  - id: g_restart_pending
+    type: uint32_t
+    initial_value: '0'
+
+# ============================================================
+# INTERVAL — Heartbeat + UART Reader
+# ============================================================
+interval:
+  # --- Heartbeat 1с + мьют зуммера ---
+  # TYPE2 heartbeat каждую секунду (watchdog соединения).
+  # Первый байт данных = WiFi-статус для LED5 на плате ESP8285:
+  #   '1' → WiFi STA подключён → LED5 мигает 500мс
+  #   '3' → AP mode активен   → LED5 мигает 100мс (быстро)
+  #   '0' → WiFi выкл          → LED5 не горит
+  # ⚠️ НЕ отправлять '2' — это зажигает LED6 (комнатный датчик)!
+  # hi=0 каждую секунду → мьют зуммера БЕЗ активации ЭКО.
+  # AP enforcement: ESPHome отключает AP при STA connected.
+  #   Хак: вызываем wifi_set_opmode_current(STATIONAP_MODE=3)
+  #   каждую секунду пока g_ap_active > 0.
+  #   AP автоотключается через g_ap_timeout (5 минут).
+  - interval: 1s
+    then:
+      - lambda: |-
+          // Deferred restart (WiFi save)
+          if (id(g_restart_pending) > 0 && millis() > id(g_restart_pending)) {
+            ESP.restart();
+          }
+          if (!id(hb_enabled)) return;
+          // Auto-AP: 60с без WiFi → включить AP автоматически
+          static uint32_t last_sta_ok = 0;
+          if (WiFi.isConnected()) {
+            last_sta_ok = millis();
+          } else if (id(g_ap_active) == 0 && millis() > 60000
+                     && (last_sta_ok == 0 || millis() - last_sta_ok > 60000)) {
+            id(g_ap_active) = millis() ? millis() : 1;
+            wifi_set_opmode_current(STATIONAP_MODE);
+          }
+          // AP: enforce STATIONAP + auto-off 5min (только если STA ОК)
+          if (id(g_ap_active) > 0) {
+            if (WiFi.isConnected() && millis() - id(g_ap_active) > 300000) {
+              id(g_ap_active) = 0;
+              wifi_set_opmode_current(STATION_MODE);
+            } else if (wifi_get_opmode() != STATIONAP_MODE) {
+              wifi_set_opmode_current(STATIONAP_MODE);
+            }
+          }
+          
+          // === WiFi status → LED5 на плате ESP8285 ===
+          // ESP8285 поддерживает ТОЛЬКО мигание, не постоянное свечение!
+          // '1' → LED5 мигает 500мс (поиск WiFi / подключён)
+          // '3' → LED5 мигает 100мс (AP mode — нужна настройка)
+          // '0' → LED5 не горит
+          uint8_t wifi_status;
+          if (id(g_ap_active) > 0) {
+            wifi_status = '3';  // AP mode → быстрое мигание 100мс
+          } else {
+            wifi_status = '1';  // Searching / Connected → мигание 500мс
+          }
+          
+          // === TYPE 2: heartbeat (connection watchdog) ===
+          uint8_t cnt;
+          if (id(hb_static)) {
+            cnt = '0';
+          } else {
+            id(hb_counter) = (id(hb_counter) + 1) % 9;
+            cnt = '0' + id(hb_counter);
+          }
+          uint8_t hb[] = {0x01, 0x32, 0x02, wifi_status, cnt, 0x03, 0x0D, 0x0A};
+          id(uart_boiler).write_array(hb, sizeof(hb));
+          
+          // === hi=0: мьют зуммера БЕЗ активации ЭКО ===
+          bool can_mute = !id(cmd_needs_mute) || (millis() - id(cmd_sent_ms) > 3000);
+          if (can_mute) {
+            if (id(cmd_needs_mute)) {
+              id(cmd_needs_mute) = false;
+              ESP_LOGW("MUTE", "Response timeout 3s — forcing mute");
+            }
+            uint8_t hi[] = {0x01,0x31,0x02, 0x30,0x30,0x30, 0x68,0x69, 0x03};
+            id(uart_boiler).write_array(hi, sizeof(hi));
+          }
+          
+          if (id(hb_counter) == 0) {
+            ESP_LOGD("HB", "wifi=%c ap=%lu T=%d fire=%d mode=%d eco=%d",
+              (char)wifi_status, (unsigned long)id(g_ap_active),
+              id(g_temp), id(g_fire), id(g_mode), id(g_eco));
+          }
+
+  # --- UART reader каждые 100мс ---
+  - interval: 100ms
+    then:
+      - lambda: |-
+          static int state = 0;
+          static std::string type_field = "";
+          static std::string data_field = "";
+          static uint32_t last_byte_ms = 0;
+          
+          if (state != 0 && (millis() - last_byte_ms > 1000)) {
+            state = 0;
+          }
+          
+          while (id(uart_boiler).available()) {
+            uint8_t byte;
+            id(uart_boiler).read_byte(&byte);
+            last_byte_ms = millis();
+            
+            if (byte == 0x01) {
+              state = 1;
+              type_field = "";
+              data_field = "";
+            }
+            else if (byte == 0x02 && state == 1) {
+              state = 2;
+            }
+            else if (byte == 0x03 && state == 2) {
+              state = 0;
+              
+              if (type_field == "1") {
+                std::string &s = data_field;
+                
+                auto xint = [&](const std::string &src, char key) -> int {
+                  size_t pos = src.find(key);
+                  if (pos == std::string::npos || pos + 1 >= src.length()) return -999;
+                  std::string n = "";
+                  for (size_t i = pos + 1; i < src.length(); i++) {
+                    char c = src[i];
+                    if ((c >= '0' && c <= '9') || (c == '-' && n.empty())) n += c;
+                    else break;
+                  }
+                  return n.empty() ? -999 : atoi(n.c_str());
+                };
+                
+                // Runtime
+                int va = xint(s, 'a');
+                int vd = xint(s, 'd');
+                int ve = xint(s, 'e');
+                int vg = xint(s, 'g');
+                int vj = xint(s, 'j');
+                int vk = xint(s, 'k');
+                
+                // EEPROM (после 'l')
+                size_t l_pos = s.find('l');
+                std::string up = (l_pos != std::string::npos) ? s.substr(l_pos) : s;
+                int vA = xint(up, 'A');
+                int vB = xint(up, 'B');
+                int vC = xint(up, 'C');
+                int vD = xint(up, 'D');
+                int vE = xint(up, 'E');
+                int vF = xint(up, 'F');
+                int vG = xint(up, 'G');
+                int vK = xint(up, 'K');
+                int vL = xint(up, 'L');
+                
+                if (va != -999) id(g_setpoint) = va;
+                if (vd != -999) id(g_temp) = vd;
+                if (ve != -999) id(g_mode) = ve;
+                if (vg != -999) id(g_overheat) = vg;
+                if (vj != -999) id(g_warning) = vj;
+                if (vk != -999) id(g_eco) = vk;
+                if (vG != -999) id(g_fire) = vG;
+                if (vE != -999) id(g_E) = vE;
+                if (vA != -999) id(g_A) = vA;
+                if (vB != -999) id(g_B) = vB;
+                if (vC != -999) id(g_C) = vC;
+                if (vD != -999) id(g_D) = vD;
+                if (vF != -999) id(g_F) = vF;
+                if (vK != -999) id(g_K) = vK;
+                if (vL != -999) id(g_L) = vL;
+                
+                ESP_LOGW("BOILER", "mode=%d fire=%d warn=%d ovht=%d eco=%d temp=%d setpt=%d | A=%d B=%d C=%d D=%d E=%d F=%d K=%d L=%d",
+                         ve, vG, vj, vg, vk, vd, va, vA, vB, vC, vD, vE, vF, vK, vL);
+                
+                // === КНОПКА 4 (5 сек) → AP MODE ===
+                // ESP8285 отправляет e=3 при длинном нажатии кнопки 4.
+                // Тоггл: первое → AP ON, второе → AP OFF.
+                // ESPHome перехватывает WiFi и выключает AP при STA connected.
+                // Хак: используем ESP8266 SDK напрямую + enforcement в heartbeat.
+                if (ve == 3) {
+                  if (id(g_ap_active) == 0) {
+                    id(g_ap_active) = millis() ? millis() : 1;
+                    wifi_set_opmode_current(STATIONAP_MODE);
+                  } else {
+                    id(g_ap_active) = 0;
+                    wifi_set_opmode_current(STATION_MODE);
+                  }
+                }
+                
+                // Sync number sliders ← actual board EEPROM values
+                if (va != -999) id(num_setpoint).publish_state(va);
+                if (vD != -999) id(num_triac_duty).publish_state(vD);
+                if (vA != -999) id(num_fan_min).publish_state(vA);
+                if (vC != -999) id(num_max_temp).publish_state(vC);
+                if (vB != -999) id(num_anticycle).publish_state(vB);
+                if (vL != -999) id(num_max_run).publish_state(vL);
+                if (vF != -999) id(num_fire_threshold).publish_state(vF);
+                if (vK != -999) id(num_room_setpoint).publish_state(vK);
+                if (vE != -999) id(num_pump_threshold).publish_state(vE);
+                
+                // Response-triggered mute: ответ = команда обработана → hi=0
+                if (id(cmd_needs_mute)) {
+                  id(cmd_needs_mute) = false;
+                  uint8_t hi_m[] = {0x01,0x31,0x02, 0x30,0x30,0x30, 0x68,0x69, 0x03};
+                  id(uart_boiler).write_array(hi_m, sizeof(hi_m));
+                  ESP_LOGD("MUTE", ">>> hi=0 (resp-triggered, buzz=%dms)",
+                    (int)(millis() - id(cmd_sent_ms)));
+                }
+              }
+            }
+            else if (state == 1) {
+              type_field += (char)byte;
+            }
+            else if (state == 2) {
+              data_field += (char)byte;
+            }
+          }
+
+# ============================================================
+# SENSORS — Статус котла
+# ============================================================
+sensor:
+  - platform: template
+    name: "Температура воды"
+    id: sensor_temp
+    lambda: 'return id(g_temp);'
+    update_interval: 5s
+    accuracy_decimals: 0
+    unit_of_measurement: "°C"
+    icon: "mdi:thermometer"
+
+  - platform: template
+    name: "Целевая темп. (a)"
+    id: sensor_setpoint
+    lambda: 'return id(g_setpoint);'
+    update_interval: 5s
+    accuracy_decimals: 0
+    unit_of_measurement: "°C"
+    icon: "mdi:thermometer-check"
+
+  - platform: template
+    name: "Режим (e)"
+    id: sensor_mode
+    lambda: 'return id(g_mode);'
+    update_interval: 5s
+    accuracy_decimals: 0
+    icon: "mdi:state-machine"
+
+# ============================================================
+# BINARY SENSORS — бинарные индикаторы (подсвечиваются в HA)
+# ============================================================
+binary_sensor:
+  - platform: template
+    name: "Насос"
+    id: bsensor_pump
+    device_class: running
+    lambda: |-
+      int t = id(g_temp);
+      int e = id(g_E);
+      int m = id(g_mode);
+      if (m == 0) return false;    // система ВЫКЛ → насос ВЫКЛ
+      if (e == 0) return true;     // E=0 → насос всегда ВКЛ
+      if (t >= e) return true;     // T≥E → GPIO4=1 → насос ВКЛ
+      return false;                // T<E → насос ВЫКЛ
+    icon: "mdi:pump"
+
+  - platform: template
+    name: "Горение"
+    id: bsensor_fire
+    device_class: heat
+    lambda: |-
+      return id(g_fire) == 1;
+    icon: "mdi:fire"
+
+  - platform: template
+    name: "⚠️ Внимание (90°C+)"
+    id: bsensor_warning
+    device_class: heat
+    lambda: |-
+      return id(g_warning) == 1;
+    icon: "mdi:thermometer-alert"
+
+  - platform: template
+    name: "🚨 Перегрев (120°C+)"
+    id: bsensor_overheat
+    device_class: problem
+    lambda: |-
+      return id(g_overheat) == 1;
+    icon: "mdi:alert-circle"
+
+text_sensor:
+  - platform: template
+    name: "STA Статус котла"
+    id: tsensor_status
+    lambda: |-
+      int m = id(g_mode);
+      int e = id(g_eco);
+      if (m == -1) return std::string("🔄 Подключение...");
+      if (m == 0) return std::string("⛔ ВЫКЛ");
+      if (m == 3) return std::string("🚨 ОШИБКА");
+      std::string s = "";
+      if (m == 2) s = "🔥 НАГРЕВ";
+      else if (m == 1) s = "⏳ ОЖИДАНИЕ";
+      else s = "❓ mode=" + to_string(m);
+      int t = id(g_temp);
+      int e_val = id(g_E);
+      if (e_val > 0 && t < e_val) s += " | НАСОС⛔";
+      else s += " | НАСОС✅";
+      if (id(g_overheat) == 1) s += " | 🚨ПЕРЕГРЕВ!";
+      else if (id(g_warning) == 1) s += " | ⚠️90°C+";
+      if (e == 1) s += " | ⚠️ЭКО!";
+      return s;
+    update_interval: 3s
+    icon: "mdi:fire"
+
+# ============================================================
+# СВИТЧ НАГРЕВА — de=1/0, отражает реальное состояние платы
+# ============================================================
+# ЗУММЕР: response-triggered mute. После команды ждём ответ
+# платы (TYPE 1 response), затем сразу hi=0 (мьют без ЭКО).
+# Buzz ≈ 1 цикл main loop ESP8285 ≈ 1-2с.
+# ============================================================
+switch:
+  - platform: template
+    name: "Нагрев"
+    id: sw_heating
+    icon: "mdi:fire"
+    restore_mode: DISABLED
+    lambda: 'return id(g_mode) > 0;'
+    turn_on_action:
+      - lambda: |-
+          id(cmd_needs_mute) = true;
+          id(cmd_sent_ms) = millis();
+          uint8_t f[] = {0x01,0x31,0x02, 0x30,0x30,0x31, 0x64,0x65, 0x03};
+          id(uart_boiler).write_array(f, sizeof(f));
+          ESP_LOGW("cmd", ">>> HEATING ON (de=1)");
+    turn_off_action:
+      - lambda: |-
+          id(cmd_needs_mute) = true;
+          id(cmd_sent_ms) = millis();
+          uint8_t f[] = {0x01,0x31,0x02, 0x30,0x30,0x30, 0x64,0x65, 0x03};
+          id(uart_boiler).write_array(f, sizeof(f));
+          ESP_LOGW("cmd", ">>> HEATING OFF (de=0)");
+
+# ============================================================
+# КНОПКИ УПРАВЛЕНИЯ
+# ============================================================
+# ============================================================
+# УСТАВКА ТЕМПЕРАТУРЫ — прямое управление
+# ============================================================
+number:
+  # [7] a — ЦЕЛЕВАЯ ТЕМПЕРАТУРА ВОДЫ (°C)
+  #   param[7] → EEPROM slot 0x0D, команда ab=XX
+  #   Определяет целевую (максимальную) температуру воды:
+  #   - T < ab → вент. на МАКСИМУМЕ (D%) — наддув, разгон
+  #   - T ≈ ab → вент. МОДУЛЯЦИЯ (C%..D%, пропорционально)
+  #   - T > ab → вент. на МИНИМУМЕ (C%) — поддержание
+  #   - За L мин T < ab → огонь не разгорелся → затухание
+  #   Примеры: -20°C за бортом → ab=50, -40°C → ab=70
+  - platform: template
+    name: "🌡 Целевая температура"
+    id: num_setpoint
+    min_value: 30
+    max_value: 85
+    step: 1
+    initial_value: 30
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "°C"
+    icon: "mdi:thermometer-check"
+    set_action:
+      - lambda: |-
+          id(cmd_needs_mute) = true;
+          id(cmd_sent_ms) = millis();
+          int v = (int)x;
+          char vs[3];
+          snprintf(vs, sizeof(vs), "%02d", v);
+          uint8_t f[] = {0x01,0x31,0x02, 0x30,(uint8_t)vs[0],(uint8_t)vs[1], 0x61,0x62, 0x03};
+          id(uart_boiler).write_array(f, sizeof(f));
+          ESP_LOGW("cmd", ">>> ab=%d (setpoint)", v);
+
+# ============================================================
+# EEPROM ПАРАМЕТРЫ — сохраняются в плату, работают автономно
+# ============================================================
+  # [5] D — TRIAC мощность вентилятора (%)
+  #   10% = мин (задержка 7000µs, почти выкл)
+  #   100% = макс (задержка 2000µs, полная мощность)
+  #   Формула: delay_µs = map(D, 10, 100, 7000, 2000)
+  - platform: template
+    name: "⚡ FanMax Вент макс"
+    id: num_triac_duty
+    min_value: 10
+    max_value: 99
+    step: 1
+    initial_value: 60
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+    icon: "mdi:fan"
+    set_action:
+      - lambda: |-
+          id(cmd_needs_mute) = true;
+          id(cmd_sent_ms) = millis();
+          int v = (int)x;
+          char vs[3];
+          snprintf(vs, sizeof(vs), "%02d", v);
+          uint8_t f[] = {0x01,0x31,0x02, 0x30,(uint8_t)vs[0],(uint8_t)vs[1], 0x44,0x45, 0x03};
+          id(uart_boiler).write_array(f, sizeof(f));
+          ESP_LOGW("cmd", ">>> DE=%d (TRIAC fan power %%)", v);
+
+  # [8] A — Длительность продувки (сек)
+  #   Каждые B мин вентилятор включается MAX на A секунд
+  #   (дожиг газов в топке, вентиляция зольника)
+  - platform: template
+    name: "💨 PurgeDur Длит. продув"
+    id: num_fan_min
+    min_value: 0
+    max_value: 99
+    step: 1
+    initial_value: 20
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "сек"
+    icon: "mdi:fan-clock"
+    set_action:
+      - lambda: |-
+          id(cmd_needs_mute) = true;
+          id(cmd_sent_ms) = millis();
+          int v = (int)x;
+          char vs[3];
+          snprintf(vs, sizeof(vs), "%02d", v);
+          uint8_t f[] = {0x01,0x31,0x02, 0x30,(uint8_t)vs[0],(uint8_t)vs[1], 0x41,0x42, 0x03};
+          id(uart_boiler).write_array(f, sizeof(f));
+          ESP_LOGW("cmd", ">>> AB=%d (purge duration sec)", v);
+
+  # [10] C — Мин. скорость вент. при модуляции (%)
+  #   Когда T близко к уставке, вент. снижается до C%
+  #   Формула: map(C, 10, 100, max_delay, 7500µs)
+  - platform: template
+    name: "🌀 FanMod Вент мин модуляц"
+    id: num_max_temp
+    min_value: 10
+    max_value: 99
+    step: 1
+    initial_value: 40
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "%"
+    icon: "mdi:fan-speed-1"
+    set_action:
+      - lambda: |-
+          id(cmd_needs_mute) = true;
+          id(cmd_sent_ms) = millis();
+          int v = (int)x;
+          char vs[3];
+          snprintf(vs, sizeof(vs), "%02d", v);
+          uint8_t f[] = {0x01,0x31,0x02, 0x30,(uint8_t)vs[0],(uint8_t)vs[1], 0x43,0x44, 0x03};
+          id(uart_boiler).write_array(f, sizeof(f));
+          ESP_LOGW("cmd", ">>> CD=%d (fan min modulation %%)", v);
+
+  # [3] B — Интервал продувки (минуты)
+  #   Каждые B мин → вент. MAX на A сек (дожиг газов)
+  - platform: template
+    name: "⏱ Purge Интервал продув"
+    id: num_anticycle
+    min_value: 0
+    max_value: 60
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "мин"
+    icon: "mdi:timer-sand"
+    set_action:
+      - lambda: |-
+          id(cmd_needs_mute) = true;
+          id(cmd_sent_ms) = millis();
+          int v = (int)x;
+          char vs[3];
+          snprintf(vs, sizeof(vs), "%02d", v);
+          uint8_t f[] = {0x01,0x31,0x02, 0x30,(uint8_t)vs[0],(uint8_t)vs[1], 0x42,0x43, 0x03};
+          id(uart_boiler).write_array(f, sizeof(f));
+          ESP_LOGW("cmd", ">>> BC=%d (purge interval min)", v);
+
+  # [4] L — Таймаут розжига (минуты)
+  #   Если за L мин T не поднялась выше F°C → стоп (огонь не разгорелся)
+  - platform: template
+    name: "⏰ Ignition Таймаут розж"
+    id: num_max_run
+    min_value: 5
+    max_value: 99
+    step: 1
+    initial_value: 20
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "мин"
+    icon: "mdi:clock-alert"
+    set_action:
+      - lambda: |-
+          id(cmd_needs_mute) = true;
+          id(cmd_sent_ms) = millis();
+          int v = (int)x;
+          char vs[3];
+          snprintf(vs, sizeof(vs), "%02d", v);
+          uint8_t f[] = {0x01,0x31,0x02, 0x30,(uint8_t)vs[0],(uint8_t)vs[1], 0x4B,0x4C, 0x03};
+          id(uart_boiler).write_array(f, sizeof(f));
+          ESP_LOGW("cmd", ">>> KL=%d (ignition timeout min)", v);
+
+  # [9] F — ПОРОГ ОГНЯ / РОЗЖИГА (°C)
+  #   F-термостат определяет «огонь горит или нет»:
+  #   T > F+1 → огонь есть (G=0), T ≤ F → огня нет (G=1)
+  #   Используется для:
+  #   1) Таймаут розжига: за L мин T < F+1 → огонь не разгорелся → стоп
+  #   2) Затухание: T < F → огонь потух → выбег L мин → вент OFF
+  #   3) Эко-режим: целевая вент = F+5°C (если ЭКО включён)
+  #   Гистерезис 1°C встроен в прошивку
+  - platform: template
+    name: "🌀 FanThr Порог вент"
+    id: num_fire_threshold
+    min_value: 10
+    max_value: 80
+    step: 1
+    initial_value: 39
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "°C"
+    icon: "mdi:fire-alert"
+    set_action:
+      - lambda: |-
+          id(cmd_needs_mute) = true;
+          id(cmd_sent_ms) = millis();
+          int v = (int)x;
+          char vs[3];
+          snprintf(vs, sizeof(vs), "%02d", v);
+          uint8_t f[] = {0x01,0x31,0x02, 0x30,(uint8_t)vs[0],(uint8_t)vs[1], 0x46,0x47, 0x03};
+          id(uart_boiler).write_array(f, sizeof(f));
+          ESP_LOGW("cmd", ">>> FG=%d (fire/ignition threshold C)", v);
+
+  # [1] K — Калибровка NTC (°C)
+  #   Смещение = K - 20. При K=20 → смещение 0°C
+  - platform: template
+    name: "🔧 TempCal Калибровка"
+    id: num_room_setpoint
+    min_value: 0
+    max_value: 40
+    step: 1
+    initial_value: 20
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "°C"
+    icon: "mdi:tune-vertical"
+    set_action:
+      - lambda: |-
+          id(cmd_needs_mute) = true;
+          id(cmd_sent_ms) = millis();
+          int v = (int)x;
+          char vs[3];
+          snprintf(vs, sizeof(vs), "%02d", v);
+          uint8_t f[] = {0x01,0x31,0x02, 0x30,(uint8_t)vs[0],(uint8_t)vs[1], 0x4A,0x4B, 0x03};
+          id(uart_boiler).write_array(f, sizeof(f));
+          ESP_LOGW("cmd", ">>> JK=%d (NTC calibration)", v);
+
+  # [0] E — ПОРОГ НАСОСА (°C) — GPIO4
+  #   T ≥ E → GPIO4=HIGH → насос ВКЛ
+  #   T < E-2 → GPIO4=LOW → насос ВЫКЛ (гистерезис 2°C)
+  #   ⚠️ E=0 → насос ВСЕГДА ВКЛ (аварийный режим)
+  #   ⚠️ E=99 → насос НИКОГДА не включится!
+  - platform: template
+    name: "🔥 Pump Порог насоса"
+    id: num_pump_threshold
+    min_value: 0
+    max_value: 99
+    step: 1
+    initial_value: 39
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: "°C"
+    icon: "mdi:pump"
+    set_action:
+      - lambda: |-
+          id(cmd_needs_mute) = true;
+          id(cmd_sent_ms) = millis();
+          int v = (int)x;
+          char vs[3];
+          snprintf(vs, sizeof(vs), "%02d", v);
+          uint8_t f[] = {0x01,0x31,0x02, 0x30,(uint8_t)vs[0],(uint8_t)vs[1], 0x45,0x46, 0x03};
+          id(uart_boiler).write_array(f, sizeof(f));
+          ESP_LOGW("cmd", ">>> EF=%d (pump threshold C)", v);

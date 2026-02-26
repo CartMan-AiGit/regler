@@ -1,0 +1,18 @@
+# ESPHome build artifacts
+.esphome/
+.pioenvs/
+.piolibdeps/
+__pycache__/
+
+# Secrets (contains real passwords!)
+secrets.yaml
+
+# macOS
+.DS_Store
+._*
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/

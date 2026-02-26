@@ -1,0 +1,11 @@
+body { font: 14px/1.6 system-ui, sans-serif; margin: 8px; max-width: 960px; }
+h1, h2 { border-bottom: 1px solid #eee; padding-bottom: 8px; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; padding: 8px; border-bottom: 2px solid #ddd; }
+td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: middle; }
+input[type=number] { width: 80px; padding: 4px; }
+input[type=range] { width: 120px; }
+button { padding: 4px 12px; cursor: pointer; border-radius: 4px; margin: 0 2px; }
+#log { max-height: 300px; overflow: auto; background: #1c1c1c; color: #eee; padding: 8px; font: 12px monospace; white-space: pre-wrap; }
+.e { color: #f44; } .w { color: #fa0; } .i { color: #4c4; }
+.c { color: #c4c; } .d { color: #4cc; } .v { color: #ccc; }
