@@ -1,4 +1,4 @@
-# 🔥 Regler — ESPHome Boiler Controller
+# 🔥 Regler — Контроллер Regler PRO wi-fi
 
 **ESP-01S (ESP8266) replacement firmware for solid-fuel boiler control boards based on ESP8285 + TM1637.**
 
