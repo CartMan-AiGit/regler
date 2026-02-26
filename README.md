@@ -137,7 +137,7 @@ WiFi credentials stored in dedicated flash sector (0xF9), survives OTA updates.
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/YOUR_USERNAME/regler.git
+git clone https://github.com/CartMan-AiGit/regler.git
 cd regler
 ```
 
